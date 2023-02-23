@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"net/http"
@@ -27,7 +28,7 @@ type Post struct {
 }
 type User struct {
 	gorm.Model
-	Name     string `json:"name"`
+	Fullname string `json:"fullname"`
 	Username string `json:"username" gorm:"unique"`
 	Email    string `json:"email" gorm:"unique"`
 	Password string `json:"password"`
@@ -50,8 +51,6 @@ func (user *User) CheckPassword(providedPassword string) error {
 }
 func uploadImage(cld *cloudinary.Cloudinary, ctx context.Context, file interface{}) string {
 
-	// Upload the image.
-	// Set the asset's public ID and allow overwriting the asset with new versions
 	resp, err := cld.Upload.Upload(ctx, file, uploader.UploadParams{
 		PublicID:       "quickstart_butterfly_2",
 		UniqueFilename: api.Bool(false),
@@ -76,6 +75,24 @@ func listItem(db *gorm.DB) http.HandlerFunc {
 			return
 		}
 		buf.WriteTo(w)
+	}
+}
+func createUser(db *gorm.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" {
+			t, _ := template.ParseFiles("register.html")
+			t.Execute(w, nil)
+		} else {
+			r.ParseForm()
+			user := User{
+				Fullname: r.Form["fullname"][0],
+				Username: r.Form["username"][0],
+				Email:    r.Form["email"][0],
+			}
+			user.hashPassword(r.Form["password"][0])
+			db.Create(&user)
+
+		}
 	}
 }
 func createPost(db *gorm.DB) http.HandlerFunc {
@@ -109,7 +126,34 @@ func createPost(db *gorm.DB) http.HandlerFunc {
 		}
 	}
 }
-
+func getUser(db *gorm.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var result []User
+		db.Model(&User{}).Limit(100).Find(&result)
+		a, _ := json.Marshal(result)
+		fmt.Fprint(w, string(a))
+	}
+}
+func login(db *gorm.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" {
+			t, _ := template.ParseFiles("login.html")
+			t.Execute(w, nil)
+		} else {
+			var user User
+			r.ParseForm()
+			username := r.Form["username"][0]
+			password := r.Form["password"][0]
+			db.Where("username = ?", username).First(&user)
+			err := user.CheckPassword(password)
+			if err != nil {
+				fmt.Fprintf(w, "error")
+			} else {
+				fmt.Fprintf(w, "done")
+			}
+		}
+	}
+}
 func main() {
 	db, err := gorm.Open(sqlite.Open("test.db"), &gorm.Config{})
 	if err != nil {
@@ -119,10 +163,14 @@ func main() {
 	port := os.Getenv("PORT")
 
 	db.AutoMigrate(&Post{})
+	db.AutoMigrate(&User{})
 	fs := http.FileServer(http.Dir("assets"))
 	mux := http.NewServeMux()
 	mux.Handle("/assets/", http.StripPrefix("/assets/", fs))
-	mux.HandleFunc("/create", createPost(db))
+	mux.HandleFunc("/create-post", createPost(db))
 	mux.HandleFunc("/", listItem(db))
+	mux.HandleFunc("/auth/register", createUser(db))
+	mux.HandleFunc("/auth/login", login(db))
+	mux.HandleFunc("/users", getUser(db))
 	http.ListenAndServe(":"+port, mux)
 }
