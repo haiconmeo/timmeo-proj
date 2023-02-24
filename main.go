@@ -8,10 +8,12 @@ import (
 	"html/template"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/cloudinary/cloudinary-go/v2"
 	"github.com/cloudinary/cloudinary-go/v2/api"
 	"github.com/cloudinary/cloudinary-go/v2/api/uploader"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/joho/godotenv"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/driver/sqlite"
@@ -19,6 +21,7 @@ import (
 )
 
 var tlp = template.Must(template.ParseFiles("index.html"))
+var sampleSecretKey = []byte("SecretYouShouldHide")
 
 type Post struct {
 	gorm.Model
@@ -32,6 +35,15 @@ type User struct {
 	Username string `json:"username" gorm:"unique"`
 	Email    string `json:"email" gorm:"unique"`
 	Password string `json:"password"`
+}
+
+type Result struct {
+	Data     []Post
+	Username string
+}
+type Claims struct {
+	Username string `json:"username"`
+	jwt.RegisteredClaims
 }
 
 func (user *User) hashPassword(password string) error {
@@ -62,14 +74,41 @@ func uploadImage(cld *cloudinary.Cloudinary, ctx context.Context, file interface
 	// Log the delivery URL
 	return string(resp.SecureURL)
 }
+func authorize(r *http.Request) (string, error) {
+	c, err := r.Cookie("token")
+	if err != nil {
+		return "", err
+	}
+	tknStr := c.Value
+	claims := &Claims{}
+	tkn, err := jwt.ParseWithClaims(tknStr, claims, func(token *jwt.Token) (interface{}, error) {
+		return sampleSecretKey, nil
+	})
+	if err != nil {
+		if err == jwt.ErrSignatureInvalid {
+			return "", err
+		}
+		return "", err
+	}
+	if !tkn.Valid {
+		return "", err
+	}
+	return claims.Username, nil
+}
 func listItem(db *gorm.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+
+		username, _ := authorize(r)
+		// q := r.URL.Query().Get("q")
 		var result []Post
+		// fmt.Println("q", r.URL)
 		db.Model(&Post{}).Limit(100).Find(&result)
-		// a, _ := json.Marshal(result)
-		// fmt.Fprint(w, string(a))
+		data := Result{
+			Data:     result,
+			Username: username,
+		}
 		buf := &bytes.Buffer{}
-		err := tlp.Execute(buf, result)
+		err := tlp.Execute(buf, data)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -91,6 +130,7 @@ func createUser(db *gorm.DB) http.HandlerFunc {
 			}
 			user.hashPassword(r.Form["password"][0])
 			db.Create(&user)
+			http.Redirect(w, r, "/auth/login", http.StatusFound)
 
 		}
 	}
@@ -149,10 +189,43 @@ func login(db *gorm.DB) http.HandlerFunc {
 			if err != nil {
 				fmt.Fprintf(w, "error")
 			} else {
-				fmt.Fprintf(w, "done")
+				expirationTime := time.Now().Add(50 * time.Minute)
+				claims := &Claims{
+					Username: user.Username,
+					RegisteredClaims: jwt.RegisteredClaims{
+						ExpiresAt: jwt.NewNumericDate(expirationTime),
+					},
+				}
+				token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+				tokenString, err := token.SignedString(sampleSecretKey)
+				if err != nil {
+					fmt.Println(err)
+					fmt.Fprintf(w, "error create token")
+				}
+
+				if err != nil {
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+				http.SetCookie(w, &http.Cookie{
+					Name:    "token",
+					Value:   tokenString,
+					Expires: expirationTime,
+					Path:    "/",
+				})
+				http.Redirect(w, r, "/", http.StatusFound)
+
 			}
 		}
 	}
+}
+func logout(w http.ResponseWriter, r *http.Request) {
+	http.SetCookie(w, &http.Cookie{
+		Name:    "token",
+		Expires: time.Now(),
+		Path:    "/",
+	})
+	http.Redirect(w, r, "/", http.StatusFound)
 }
 func main() {
 	db, err := gorm.Open(sqlite.Open("test.db"), &gorm.Config{})
@@ -171,6 +244,7 @@ func main() {
 	mux.HandleFunc("/", listItem(db))
 	mux.HandleFunc("/auth/register", createUser(db))
 	mux.HandleFunc("/auth/login", login(db))
+	mux.HandleFunc("/auth/logout", logout)
 	mux.HandleFunc("/users", getUser(db))
 	http.ListenAndServe(":"+port, mux)
 }
